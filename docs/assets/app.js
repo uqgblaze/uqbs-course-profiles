@@ -10,12 +10,44 @@
 // ---- shared ---------------------------------------------------------------
 const STORE = {
   manifest: null,
+  manifestAll: null,
+  manifestLegacy: null,
   taxonomy: null,
+  aol: null,
+  loOverrides: null,
+  teachingPeriods: null,
+  selected: new Set(),   // course.file paths ticked for download
+  filtered: [],          // current filtered+sorted list (set by render)
+  renderFn: null,        // active browser's render function
 };
 
+// ---- edition config -------------------------------------------------------
+// One codebase, two published editions. `window.SITE` is set by assets/site-config.js
+// (the only file the dual-build swaps per edition). Falls back to the UQBS,
+// self-contained defaults so local dev and tests behave as before.
+//   edition : "uqbs" -> UQBS view, AoL/GA layers ON
+//             "all"  -> All-UQ public view, AoL/GA layers OFF
+//   dataBase: ""     -> bulk data (profile JSONs + big manifests) served same-origin
+//             "https://host/base/" -> fetched cross-origin from that base, so a
+//               light edition (e.g. UQBS on teach.business) needn't carry the data.
+const SITE = (typeof window !== "undefined" && window.SITE) || { edition: "uqbs", dataBase: "", repoUrl: "", uqbsUrl: "", allUrl: "", reportEmail: "" };
+const EDITION = SITE.edition === "all" ? "all" : "uqbs";
+const DATA_BASE = (SITE.dataBase || "").replace(/\/+$/, "");
+
+// URL for bulk/shared data. Same-origin when DATA_BASE is empty.
+function dataUrl(rel) {
+  const clean = String(rel).replace(/^\.?\//, "");
+  return DATA_BASE ? `${DATA_BASE}/${clean}` : `./${clean}`;
+}
+
 const DATA_PATHS = {
-  manifest: "./assets/manifest.json",
+  manifest: "./assets/manifest.json",                      // primary index — ships with each edition
+  manifestAll: dataUrl("assets/manifest-all.json"),        // bulk/shared
+  manifestLegacy: dataUrl("assets/manifest-legacy.json"),  // bulk/shared
   taxonomy: "./taxonomy/uqbs-programs.json",
+  aol: "./taxonomy/aol-status.json",
+  loOverrides: "./taxonomy/lo-overrides.json",
+  teachingPeriods: "./taxonomy/teaching-periods.json",
 };
 
 async function loadManifest() {
@@ -26,6 +58,39 @@ async function loadManifest() {
   return STORE.manifest;
 }
 
+async function loadManifestAll() {
+  if (STORE.manifestAll) return STORE.manifestAll;
+  const res = await fetch(DATA_PATHS.manifestAll, { cache: "no-cache" });
+  if (!res.ok) throw new Error(`Could not load full manifest: ${res.status}`);
+  STORE.manifestAll = await res.json();
+  return STORE.manifestAll;
+}
+
+// Legacy profile manifest (2009–S1 2024), kept separate from the live UQBS
+// manifest. Loaded opt-in for the per-course timeline. Graceful fallback when
+// absent (the timeline simply shows current-system offerings only).
+async function loadManifestLegacy() {
+  if (STORE.manifestLegacy) return STORE.manifestLegacy;
+  try {
+    const res = await fetch(DATA_PATHS.manifestLegacy, { cache: "no-cache" });
+    if (!res.ok) { STORE.manifestLegacy = { periods: {} }; return STORE.manifestLegacy; }
+    STORE.manifestLegacy = await res.json();
+  } catch (_e) {
+    STORE.manifestLegacy = { periods: {} };
+  }
+  return STORE.manifestLegacy;
+}
+
+// Flatten a legacy manifest's period buckets into a single offering list.
+function getLegacyCourses(manifestLegacy) {
+  const out = [];
+  const periods = (manifestLegacy && manifestLegacy.periods) || {};
+  for (const key of Object.keys(periods)) {
+    for (const entry of periods[key]) out.push(entry);
+  }
+  return out;
+}
+
 async function loadTaxonomy() {
   if (STORE.taxonomy) return STORE.taxonomy;
   const res = await fetch(DATA_PATHS.taxonomy, { cache: "no-cache" });
@@ -34,8 +99,67 @@ async function loadTaxonomy() {
   return STORE.taxonomy;
 }
 
+async function loadAol() {
+  if (STORE.aol) return STORE.aol;
+  const res = await fetch(DATA_PATHS.aol, { cache: "no-cache" });
+  if (!res.ok) { STORE.aol = { semesters: {} }; return STORE.aol; }
+  STORE.aol = await res.json();
+  return STORE.aol;
+}
+
+// Manual LO-to-assessment override overlay (patches the Drupal ECP bug that
+// drops LO mappings, fully or partially). Graceful fallback when absent.
+async function loadLoOverrides() {
+  if (STORE.loOverrides) return STORE.loOverrides;
+  const res = await fetch(DATA_PATHS.loOverrides, { cache: "no-cache" });
+  if (!res.ok) { STORE.loOverrides = { overrides: [] }; return STORE.loOverrides; }
+  STORE.loOverrides = await res.json();
+  return STORE.loOverrides;
+}
+
+// Teaching-period registry (taxonomy/teaching-periods.json) — semester-code
+// metadata incl. summer/medical special periods. Graceful fallback when absent.
+async function loadTeachingPeriods() {
+  if (STORE.teachingPeriods) return STORE.teachingPeriods;
+  const res = await fetch(DATA_PATHS.teachingPeriods, { cache: "no-cache" });
+  if (!res.ok) { STORE.teachingPeriods = { periods: {} }; return STORE.teachingPeriods; }
+  STORE.teachingPeriods = await res.json();
+  return STORE.teachingPeriods;
+}
+
+// Get AoL entries for a specific course code (across all semesters, or for a specific semester)
+function getAolForCourse(aol, courseCode, semesterCode) {
+  if (!aol || !aol.semesters) return [];
+  const entries = [];
+  for (const [sem, data] of Object.entries(aol.semesters)) {
+    if (semesterCode && sem !== semesterCode) continue;
+    for (const e of (data.entries || [])) {
+      if (e.course_code === courseCode) entries.push({ ...e, semester_code: sem, semester_label: data.label });
+    }
+  }
+  return entries;
+}
+
+// Status display config
+const AOL_STATUS = {
+  tbd:           { label: "TBD",            icon: "📋", cls: "aol-tbd" },
+  identified:    { label: "Identified",     icon: "🔍", cls: "aol-identified" },
+  rubric_in_dev: { label: "Rubric in Dev",  icon: "🔨", cls: "aol-rubric-dev" },
+  active:        { label: "Active",         icon: "✅", cls: "aol-active" },
+  established:   { label: "Established",    icon: "🏆", cls: "aol-established" },
+};
+
+function aolStatusChip(status) {
+  const s = AOL_STATUS[status] || { label: status, icon: "?", cls: "aol-unknown" };
+  return `<span class="aol-chip ${s.cls}" title="${escapeHtml(s.label)}">${s.icon} ${escapeHtml(s.label)}</span>`;
+}
+
+function aolGaChip(ga) {
+  return `<span class="aol-ga-chip" title="${escapeHtml(ga)}">${escapeHtml(ga)}</span>`;
+}
+
 async function loadCourseJson(relPath) {
-  const res = await fetch(`./${relPath}`, { cache: "no-cache" });
+  const res = await fetch(dataUrl(relPath), { cache: "no-cache" });
   if (!res.ok) throw new Error(`Could not load ${relPath}: ${res.status}`);
   return res.json();
 }
@@ -62,12 +186,173 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
+// Parse study_period into a short label, e.g. "Semester 1, 2026 (23/02/...)" → "S1 2026".
+// Falls back to semester_code if study_period is missing.
+function semesterLabel(course) {
+  const sp = course.study_period || "";
+  const m = sp.match(/Semester\s+(\d),?\s+(\d{4})/i);
+  if (m) return `S${m[1]} ${m[2]}`;
+  const sm = sp.match(/Summer\s+Semester,?\s+(\d{4})/i);
+  if (sm) return `Sum ${sm[1]}`;
+  // Fallback: derive from semester_code via the teaching-period registry
+  // (taxonomy/teaching-periods.json), which knows summer and special periods.
+  const code = course.semester_code || "";
+  const reg = STORE.teachingPeriods && STORE.teachingPeriods.periods;
+  if (reg && reg[code] && reg[code].short) return reg[code].short;
+  // Last resort: legacy hardcoded map (kept for registry-load failures)
+  const codeMap = {
+    "7460": "S2 2024", "7480": "Sum 2025", "7520": "S1 2025",
+    "7560": "S2 2025", "7580": "Sum 2026", "7620": "S1 2026",
+    "7660": "S2 2026", "7700": "S1 2027", "7740": "S2 2027",
+  };
+  return codeMap[code] || code;
+}
+
+// Chronological sort key for an offering, spanning both eras. Returns a
+// comparable string like "2009.1" (year.period-ordinal). Works for current
+// profiles (study_period carries the year) and legacy profiles alike, so a
+// course's offerings line up oldest→newest regardless of which system they
+// came from. Summer is ordered before its Semester 1 (it runs Nov–Feb).
+function offeringChronKey(course) {
+  const sp = course.study_period || "";
+  let year = course.year;
+  let periodOrd = 5; // unknown sorts last within a year
+  let m = sp.match(/Semester\s+(\d),?\s+(\d{4})/i);
+  if (m) { year = year || +m[2]; periodOrd = +m[1] === 1 ? 2 : 3; }
+  else {
+    m = sp.match(/Summer\s+Semester,?\s+(\d{4})/i);
+    if (m) { year = year || +m[1]; periodOrd = 1; }
+  }
+  // Legacy entries carry explicit year/period fields as a fallback
+  if (course.period) {
+    if (/Semester 1/i.test(course.period)) periodOrd = 2;
+    else if (/Semester 2/i.test(course.period)) periodOrd = 3;
+    else if (/Summer/i.test(course.period)) periodOrd = 1;
+  }
+  return `${year || 0}.${periodOrd}`;
+}
+
 // Extract the 4-letter faculty prefix from a course code (e.g. "MGTS1601" → "MGTS").
 // Used for Fun-theme faculty-colour coding on table rows.
 function coursePrefix(code) {
   if (!code) return "";
   const m = String(code).match(/^([A-Z]{3,4})/);
   return m ? m[1] : "";
+}
+
+// Normalise a learning-outcome code for display. Source data sometimes has
+// `lo.number = "LO1."` (already prefixed with "LO" and trailing period) and
+// sometimes `lo.number = 1` (bare). Produce a canonical "LO1" form.
+function loDisplayCode(lo) {
+  if (!lo) return "";
+  if (lo.code) return String(lo.code).trim().replace(/\.$/, "");
+  const n = lo.number;
+  if (n == null) return "";
+  const s = String(n).trim().replace(/\.$/, "");
+  // If already starts with "LO" (case-insensitive), normalise to uppercase
+  if (/^lo\d+$/i.test(s)) return s.toUpperCase();
+  // Otherwise prepend "LO"
+  return `LO${s}`;
+}
+
+// Parse a "learning_outcomes_assessed" string into ["LO1","LO2",…].
+// Handles variations: "L.O. 1", "LO1", "LO 1", "L01" (zero-typo), "1".
+function parseLoRefs(s) {
+  if (!s) return [];
+  const text = String(s);
+  const nums = new Set();
+  // Pattern A: L + (O or 0) + optional dot + optional space + digits
+  //   matches "LO1", "LO.1", "L.O.1", "L O 1", "L01", "L0.1"
+  const reA = /L\.?[O0]\.?\s*(\d+)/gi;
+  // Pattern B: bare numbers preceded by a comma/space/start (for strings
+  //   like "1, 2, 3") — only used if Pattern A matched nothing
+  const reB = /(?:^|[,;\s])(\d+)(?=[,;\s]|$)/g;
+  let m;
+  while ((m = reA.exec(text)) !== null) nums.add(m[1]);
+  if (nums.size === 0) {
+    while ((m = reB.exec(text)) !== null) nums.add(m[1]);
+  }
+  // Preserve first-seen order
+  return Array.from(nums).map(n => `LO${n}`);
+}
+
+// Build a lookup { assessmentTitle → [LO1, LO2, …] } from assessment_details.
+function buildAssessmentLoMap(c) {
+  const map = {};
+  if (!c || !Array.isArray(c.assessment_details)) return map;
+  for (const d of c.assessment_details) {
+    const title = (d && d.title ? String(d.title).trim() : "");
+    if (!title) continue;
+    const refs = parseLoRefs(d.learning_outcomes_assessed || d.learning_outcomes);
+    if (refs.length) map[title] = refs;
+  }
+  return map;
+}
+
+// Normalise an assessment title for matching (case/space-insensitive).
+// Mirrors _norm_title() in scraper/import_lo_overrides.py.
+function normTitle(t) {
+  return String(t || "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+// Resolve the manual LO overrides for a course offering into a lookup keyed by
+// normalised assessment title: { normTitle → { los:[…], notes } }.
+// Precedence (most specific wins): an override scoped to this exact SI-NET
+// class (class_number) beats an exact-semester override, which beats a
+// blank-semester (all-semesters) override for the same assessment.
+// Class-scoped overrides exist because parallel deliveries (MBA intensive vs
+// standard, in-person vs external) can share an assessment title but map
+// different LOs. A class-scoped entry never applies to a different class.
+function getLoOverrideMap(courseCode, semesterCode, classCode) {
+  const ov = STORE.loOverrides;
+  if (!ov || !Array.isArray(ov.overrides) || !courseCode) return {};
+  const blank = {}, exact = {}, exactClass = {};
+  for (const o of ov.overrides) {
+    if (o.course_code !== courseCode) continue;
+    const los = Array.isArray(o.learning_outcomes) ? o.learning_outcomes : [];
+    if (!los.length) continue;
+    const rec = { los, notes: o.notes || null };
+    const nt = normTitle(o.assessment_title);
+    const semMatches = o.semester_code && semesterCode && o.semester_code === semesterCode;
+    if (o.class_number) {
+      // Scoped to one class: applies only when both class and semester match.
+      if (semMatches && classCode && String(o.class_number) === String(classCode)) {
+        exactClass[nt] = rec;
+      }
+    } else if (semMatches) {
+      exact[nt] = rec;
+    } else if (!o.semester_code) {
+      blank[nt] = rec;
+    }
+  }
+  // most specific last so it wins the merge
+  return Object.assign({}, blank, exact, exactClass);
+}
+
+// Produce the COMPLETE record for a course: the scraped profile with any
+// missing/incomplete LO mappings restored from Jac (the authored curriculum
+// record). Used by the JSON downloads so every user-facing surface serves
+// complete data. Restored fields carry a provenance marker; the stored
+// profiles/ JSONs remain raw ingestion (what UQ's published page contains).
+function completeCourseJson(c) {
+  const ovMap = getLoOverrideMap(c.course_code, c.semester_code, c.class_code);
+  if (!Object.keys(ovMap).length) return c;
+  const copy = JSON.parse(JSON.stringify(c));
+  const restored = [];
+  for (const d of (copy.assessment_details || [])) {
+    const ov = ovMap[normTitle(d.title)];
+    if (!ov) continue;
+    d.learning_outcomes_assessed = ov.los.join(", ");
+    d.learning_outcomes_assessed_source = "jac";
+    restored.push((d.title || "").trim());
+  }
+  if (restored.length) {
+    copy._lo_mapping_provenance = {
+      note: "LO-to-assessment mappings for the assessments listed were restored from Jac (curriculum.uq.edu.au), the authored curriculum record. UQ's published course profile omits them due to a publishing fault.",
+      restored_from_jac: restored,
+    };
+  }
+  return copy;
 }
 
 function fmtDate(iso) {
@@ -144,6 +429,7 @@ function downloadBlob(content, filename, mimeType) {
 // Generate a Markdown document from a full course JSON.
 function buildCourseMarkdown(c, taxonomy) {
   const lines = [];
+  const ovMap = getLoOverrideMap(c.course_code, c.semester_code, c.class_code);
   lines.push(`# ${c.course_code} — ${c.course_title || ""}`);
   lines.push("");
   const metaRows = [
@@ -199,7 +485,7 @@ function buildCourseMarkdown(c, taxonomy) {
   if (Array.isArray(c.learning_outcomes) && c.learning_outcomes.length) {
     lines.push("", "## Course learning outcomes", "");
     for (const lo of c.learning_outcomes) {
-      const code = lo.code || (lo.number != null ? `LO${lo.number}` : "");
+      const code = loDisplayCode(lo);
       lines.push(`- **${code}** ${lo.description || ""}`);
     }
   }
@@ -229,10 +515,11 @@ function buildCourseMarkdown(c, taxonomy) {
       if (a.mode) meta.push(`**Mode:** ${a.mode}`);
       if (a.other_conditions) meta.push(`**Conditions:** ${a.other_conditions}`);
       if (meta.length) { lines.push(meta.join(" · ")); lines.push(""); }
-      const lo = a.learning_outcomes_assessed != null ? a.learning_outcomes_assessed : a.learning_outcomes;
+      const ov = ovMap[normTitle(a.title)];
+      const lo = ov ? ov.los : (a.learning_outcomes_assessed != null ? a.learning_outcomes_assessed : a.learning_outcomes);
       if (lo) {
         const loStr = Array.isArray(lo) ? lo.join(", ") : String(lo);
-        if (loStr) { lines.push(`**Linked LOs:** ${loStr}`); lines.push(""); }
+        if (loStr) { lines.push(`**Linked LOs:** ${loStr}${ov ? " _(from Jac, the authored curriculum record — omitted from the published profile)_" : ""}`); lines.push(""); }
       }
       if (Array.isArray(a.special_indicators) && a.special_indicators.length) {
         lines.push(`**Indicators:** ${a.special_indicators.join(", ")}`); lines.push("");
@@ -317,6 +604,7 @@ function buildCourseMarkdown(c, taxonomy) {
 // Build a standalone HTML document optimised for print-to-PDF.
 function buildPrintableHtml(c, taxonomy) {
   const esc = escapeHtml;
+  const ovMap = getLoOverrideMap(c.course_code, c.semester_code, c.class_code);
   const roles = taxonomy ? programRolesFor(c.course_code, taxonomy) : [];
   const progLine = roles.length
     ? roles.map(r => `${esc(r.program)} (${esc(r.role || "")})`).join(" · ")
@@ -390,7 +678,7 @@ function buildPrintableHtml(c, taxonomy) {
   if (Array.isArray(c.learning_outcomes) && c.learning_outcomes.length) {
     parts.push(`<h2>Learning outcomes</h2><ol>`);
     for (const lo of c.learning_outcomes) {
-      const code = lo.code || (lo.number != null ? `LO${lo.number}` : "");
+      const code = loDisplayCode(lo);
       parts.push(`<li><b>${esc(code)}</b> ${esc(lo.description || "")}</li>`);
     }
     parts.push(`</ol>`);
@@ -415,10 +703,11 @@ function buildPrintableHtml(c, taxonomy) {
       if (a.mode) m.push(`<b>Mode:</b> ${esc(a.mode)}`);
       if (a.other_conditions) m.push(`<b>Conditions:</b> ${esc(a.other_conditions)}`);
       if (m.length) parts.push(`<p>${m.join(" · ")}</p>`);
-      const lo = a.learning_outcomes_assessed != null ? a.learning_outcomes_assessed : a.learning_outcomes;
+      const ov = ovMap[normTitle(a.title)];
+      const lo = ov ? ov.los : (a.learning_outcomes_assessed != null ? a.learning_outcomes_assessed : a.learning_outcomes);
       if (lo) {
         const loStr = Array.isArray(lo) ? lo.join(", ") : String(lo);
-        if (loStr) parts.push(`<p><b>Linked LOs:</b> ${esc(loStr)}</p>`);
+        if (loStr) parts.push(`<p><b>Linked LOs:</b> ${esc(loStr)}${ov ? " (from Jac, the authored curriculum record — omitted from the published profile)" : ""}</p>`);
       }
       for (const [key, label] of [
         ["task_description", "Task description"],
@@ -496,7 +785,7 @@ function downloadCourseMarkdown(c, taxonomy) {
 }
 
 function downloadCourseJson(c) {
-  const json = JSON.stringify(c, null, 2);
+  const json = JSON.stringify(completeCourseJson(c), null, 2);
   downloadBlob(json, safeFilename(c, "json"), "application/json;charset=utf-8");
 }
 
@@ -508,10 +797,11 @@ async function initBrowser() {
   const $count = document.getElementById("course-count");
   const $meta = document.getElementById("meta-info");
   try {
-    const [manifest, taxonomy] = await Promise.all([loadManifest(), loadTaxonomy().catch(() => null)]);
+    const [manifest, taxonomy, aol] = await Promise.all([loadManifest(), loadTaxonomy().catch(() => null), loadAol().catch(() => null), loadLoOverrides().catch(() => null), loadTeachingPeriods().catch(() => null)]);
     const courses = getAllCourses(manifest);
     STORE.allCourses = courses;
     STORE.taxonomy = taxonomy;
+    STORE.aol = aol;
     $meta.innerHTML = `<span>Scrape generated</span> <b>${escapeHtml(fmtDate(manifest.generated_at))}</b> <span>· ${manifest.total_profiles} profiles</span>`;
 
     // Populate filter dropdowns
@@ -519,16 +809,33 @@ async function initBrowser() {
     populateSelect("filter-mode", uniqueSorted(courses.map(c => c.attendance_mode)));
     populateSelect("filter-location", uniqueSorted(courses.map(c => c.location)));
     if (taxonomy && taxonomy.programs) {
-      const progOpts = Object.entries(taxonomy.programs).map(([k, v]) => ({ value: k, label: `${v.name} (${k})` }));
+      const progOpts = Object.entries(taxonomy.programs)
+        .filter(([, v]) => v.is_programme !== false)
+        .map(([k, v]) => ({ value: k, label: `${v.name} (${k})` }));
       populateSelect("filter-program", progOpts);
+    }
+
+    // Populate semester filter and default to most recent
+    const semCodes = uniqueSorted(courses.map(c => c.semester_code));
+    const semOpts = semCodes.map(code => {
+      const sample = courses.find(c => c.semester_code === code);
+      return { value: code, label: sample ? semesterLabel(sample) : code };
+    });
+    populateSelect("filter-semester", semOpts);
+    // Default to most recent semester
+    const $semFilter = document.getElementById("filter-semester");
+    if ($semFilter && semCodes.length) {
+      // Default to S1 2026 (7620) when present, else the most recent semester.
+      $semFilter.value = semCodes.includes("7620") ? "7620" : semCodes[semCodes.length - 1];
     }
 
     // Initial render
     STORE.sort = { key: "course_code", dir: "asc" };
+    STORE.renderFn = render;
     bindControls();
     render();
   } catch (err) {
-    $body.innerHTML = `<tr><td colspan="7" class="error">Error loading data: ${escapeHtml(err.message)}</td></tr>`;
+    $body.innerHTML = `<tr><td colspan="11" class="error">Error loading data: ${escapeHtml(err.message)}</td></tr>`;
     console.error(err);
   }
 }
@@ -545,7 +852,7 @@ function populateSelect(id, options) {
 }
 
 function bindControls() {
-  for (const id of ["search", "filter-level", "filter-mode", "filter-location", "filter-program"]) {
+  for (const id of ["search", "filter-semester", "filter-level", "filter-mode", "filter-location", "filter-program"]) {
     const el = document.getElementById(id);
     if (el) el.addEventListener("input", render);
   }
@@ -568,6 +875,7 @@ function bindControls() {
   if ($zipMd) $zipMd.addEventListener("click", () => exportFilteredAsZip("md"));
   const $zipJson = document.getElementById("export-zip-json");
   if ($zipJson) $zipJson.addEventListener("click", () => exportFilteredAsZip("json"));
+  setupSelection();
 }
 
 async function exportFilteredAsZip(format) {
@@ -575,9 +883,9 @@ async function exportFilteredAsZip(format) {
     alert("ZIP library (JSZip) didn't load. Please check your network and try again.");
     return;
   }
-  const courses = applySort(applyFilters(STORE.allCourses || []));
+  const courses = coursesForExport(STORE.filtered || []);
   if (!courses.length) {
-    alert("No courses match the current filters.");
+    alert("No courses to export. Tick some rows, or adjust the filters.");
     return;
   }
   // Safety cap — warn the user for large selections
@@ -606,7 +914,7 @@ async function exportFilteredAsZip(format) {
           const md = buildCourseMarkdown(full, taxonomy);
           zip.file(`${safeFilename(full, "md")}`, md);
         } else {
-          zip.file(`${safeFilename(full, "json")}`, JSON.stringify(full, null, 2));
+          zip.file(`${safeFilename(full, "json")}`, JSON.stringify(completeCourseJson(full), null, 2));
         }
       } catch (err) {
         failed++;
@@ -643,7 +951,7 @@ async function exportFilteredAsZip(format) {
 }
 
 function exportFilteredAsCsv() {
-  const courses = applySort(applyFilters(STORE.allCourses || []));
+  const courses = coursesForExport(STORE.filtered || []);
   const taxonomy = STORE.taxonomy;
   const columns = [
     "course_code", "course_title", "full_course_code", "study_level",
@@ -676,8 +984,87 @@ function exportFilteredAsCsv() {
   URL.revokeObjectURL(url);
 }
 
+// ---- bulk selection (download multiple) -----------------------------------
+// Courses to export: the ticked selection if any, else the current filtered set.
+function coursesForExport(filtered) {
+  const sel = STORE.selected;
+  if (sel && sel.size) {
+    return applySort((STORE.allCourses || []).filter(c => sel.has(c.file)));
+  }
+  return filtered || [];
+}
+
+// Wire row checkboxes, the select-all box, and a "N selected · Clear" indicator.
+// Shared by both browsers; safe to call once per page.
+function setupSelection() {
+  const actions = document.querySelector(".bulk-actions");
+  if (actions && !document.getElementById("sel-info")) {
+    const info = document.createElement("span");
+    info.id = "sel-info";
+    info.className = "small muted";
+    info.style.marginLeft = "4px";
+    const clear = document.createElement("button");
+    clear.id = "sel-clear";
+    clear.type = "button";
+    clear.className = "btn-link";
+    clear.textContent = "Clear selection";
+    clear.style.display = "none";
+    const anchor = document.getElementById("bulk-status");
+    actions.insertBefore(info, anchor);
+    actions.insertBefore(clear, anchor);
+    clear.addEventListener("click", () => {
+      STORE.selected.clear();
+      if (typeof STORE.renderFn === "function") STORE.renderFn();
+    });
+  }
+  const body = document.getElementById("courses-body");
+  if (body && !body._selBound) {
+    body.addEventListener("change", (e) => {
+      const cb = e.target && e.target.closest ? e.target.closest(".row-sel") : null;
+      if (!cb) return;
+      if (cb.checked) STORE.selected.add(cb.dataset.file);
+      else STORE.selected.delete(cb.dataset.file);
+      refreshSelectionUI();
+    });
+    body._selBound = true;
+  }
+  const all = document.getElementById("select-all");
+  if (all && !all._selBound) {
+    all.addEventListener("change", () => {
+      const filtered = STORE.filtered || [];
+      if (all.checked) filtered.forEach(c => STORE.selected.add(c.file));
+      else filtered.forEach(c => STORE.selected.delete(c.file));
+      if (typeof STORE.renderFn === "function") STORE.renderFn();
+    });
+    all._selBound = true;
+  }
+}
+
+// Checkbox cell for a course row.
+function selCell(c) {
+  const checked = STORE.selected && STORE.selected.has(c.file) ? " checked" : "";
+  return `<td class="sel-col"><input type="checkbox" class="row-sel" data-file="${escapeHtml(c.file)}" aria-label="Select ${escapeHtml(c.course_code || "")}"${checked}></td>`;
+}
+
+// Update the selected-count text, Clear button, and select-all tri-state.
+function refreshSelectionUI() {
+  const n = STORE.selected ? STORE.selected.size : 0;
+  const info = document.getElementById("sel-info");
+  if (info) info.textContent = n ? `${n} selected` : "";
+  const clear = document.getElementById("sel-clear");
+  if (clear) clear.style.display = n ? "" : "none";
+  const all = document.getElementById("select-all");
+  if (all) {
+    const filtered = STORE.filtered || [];
+    const inSel = filtered.reduce((acc, c) => acc + (STORE.selected.has(c.file) ? 1 : 0), 0);
+    all.checked = filtered.length > 0 && inSel === filtered.length;
+    all.indeterminate = inSel > 0 && inSel < filtered.length;
+  }
+}
+
 function applyFilters(courses) {
   const q = (document.getElementById("search")?.value || "").trim().toLowerCase();
+  const sem = document.getElementById("filter-semester")?.value;
   const level = document.getElementById("filter-level")?.value;
   const mode = document.getElementById("filter-mode")?.value;
   const loc = document.getElementById("filter-location")?.value;
@@ -688,6 +1075,7 @@ function applyFilters(courses) {
       const hay = `${c.course_code} ${c.course_title || ""}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
+    if (sem && c.semester_code !== sem) return false;
     if (level && c.study_level !== level) return false;
     if (mode && c.attendance_mode !== mode) return false;
     if (loc && c.location !== loc) return false;
@@ -716,11 +1104,13 @@ function render() {
   const $body = document.getElementById("courses-body");
   const $count = document.getElementById("course-count");
   const courses = applySort(applyFilters(STORE.allCourses || []));
+  STORE.filtered = courses;
   $count.textContent = courses.length;
 
   if (courses.length === 0) {
-    $body.innerHTML = `<tr><td colspan="7" class="empty">No courses match the current filters.</td></tr>`;
+    $body.innerHTML = `<tr><td colspan="11" class="empty">No courses match the current filters.</td></tr>`;
     updateSortIndicators();
+    refreshSelectionUI();
     return;
   }
 
@@ -733,23 +1123,39 @@ function render() {
       return `<span class="${cls}" title="${escapeHtml(r.program_name || r.program)} — ${escapeHtml(r.role || "")}">${escapeHtml(r.program)}</span>`;
     }).join("");
     const more = roles.length > 3 ? `<span class="chip muted">+${roles.length - 3}</span>` : "";
+    // Where the course lives in each program: "Core", or the major/list name.
+    const roleChips = roles.slice(0, 3).map(r => {
+      const isCore = (r.role || "").toLowerCase() === "core";
+      return `<span class="chip ${isCore ? "role-core" : "role-major"}" title="${escapeHtml(r.program_name || r.program)}">${escapeHtml(r.role || "")}</span>`;
+    }).join("");
+    const roleMore = roles.length > 3 ? `<span class="chip muted">+${roles.length - 3}</span>` : "";
     const levelClass = (c.study_level || "").toLowerCase().includes("post") ? "level-pill pg" : "level-pill";
     const fullCode = c.full_course_code || [c.course_code, c.class_code, c.semester_code].filter(Boolean).join("-");
     const pfx = coursePrefix(c.course_code);
     const codeCls = pfx ? `code prefix-${pfx}` : "code";
+    const aolEntries = STORE.aol ? getAolForCourse(STORE.aol, c.course_code) : [];
+    const aolCell = aolEntries.length
+      ? aolEntries.map(e => `<span class="aol-chip ${(AOL_STATUS[e.status] || {}).cls || ''}" title="${escapeHtml(e.ga)}: ${escapeHtml((AOL_STATUS[e.status] || {}).label || e.status)}">${escapeHtml(e.ga)}</span>`).join(" ")
+      : "";
+    const semLabel = semesterLabel(c);
     return `
       <tr>
+        ${selCell(c)}
         <td class="${codeCls}"><a href="course.html?file=${encodeURIComponent(c.file)}">${escapeHtml(c.course_code || "")}</a></td>
         <td>${escapeHtml(c.course_title || "")}</td>
+        <td class="nowrap">${escapeHtml(semLabel)}</td>
         <td><span class="${levelClass}">${escapeHtml(c.study_level || "")}</span></td>
         <td>${escapeHtml(c.units || "")}</td>
         <td>${escapeHtml(c.attendance_mode || "")}</td>
         <td>${escapeHtml(c.location || "")}</td>
         <td>${progChips}${more}</td>
+        <td>${roleChips}${roleMore}</td>
+        <td class="aol-col">${aolCell}</td>
       </tr>`;
   }).join("");
   $body.innerHTML = rows;
   updateSortIndicators();
+  refreshSelectionUI();
 }
 
 function updateSortIndicators() {
@@ -772,10 +1178,32 @@ async function initCourseDetail() {
     return;
   }
   try {
-    const [course, taxonomy] = await Promise.all([loadCourseJson(filePath), loadTaxonomy().catch(() => null)]);
+    const [course, manifest, manifestLegacy, taxonomy, aol] = await Promise.all([
+      loadCourseJson(filePath), loadManifest(), loadManifestLegacy().catch(() => ({ periods: {} })), loadTaxonomy().catch(() => null), loadAol().catch(() => null), loadLoOverrides().catch(() => null), loadTeachingPeriods().catch(() => null)
+    ]);
     STORE.currentCourse = course;
     STORE.currentTaxonomy = taxonomy;
-    renderCourseDetail($root, course, taxonomy);
+    STORE.aol = aol;
+
+    // Find all offerings of this course across both systems (current + legacy),
+    // ordered newest→oldest. This is the spine of the per-course timeline.
+    const currentOfferings = getAllCourses(manifest);
+    // The all-of-UQ manifest covers non-UQBS courses that the UQBS manifest omits;
+    // fall back to it so the timeline is complete for any course the viewer reached.
+    let pool = currentOfferings.filter(c => c.course_code === course.course_code);
+    if (pool.length === 0) {
+      try {
+        const all = await loadManifestAll();
+        pool = getAllCourses(all).filter(c => c.course_code === course.course_code);
+      } catch (_e) { /* keep UQBS pool */ }
+    }
+    const legacyOfferings = getLegacyCourses(manifestLegacy)
+      .filter(c => c.course_code === course.course_code);
+    const otherOfferings = pool.concat(legacyOfferings)
+      .filter(c => c.file !== filePath)
+      .sort((a, b) => offeringChronKey(b).localeCompare(offeringChronKey(a), undefined, { numeric: true }));
+
+    renderCourseDetail($root, course, taxonomy, otherOfferings, filePath);
     document.title = `${course.course_code} — ${course.course_title}`;
     // Wire up download buttons after render
     const $pdf = document.getElementById("dl-pdf");
@@ -784,13 +1212,238 @@ async function initCourseDetail() {
     if ($pdf) $pdf.addEventListener("click", () => printCourseToPdf(course, taxonomy));
     if ($md) $md.addEventListener("click", () => downloadCourseMarkdown(course, taxonomy));
     if ($json) $json.addEventListener("click", () => downloadCourseJson(course));
+    // Wire the "Report an error" control — opens a prefilled email with the exact
+    // course/offering location baked in so the fix can be pinpointed.
+    const $report = document.getElementById("report-error");
+    const $panel = document.getElementById("report-panel");
+    const $send = document.getElementById("report-send");
+    const $text = document.getElementById("report-text");
+    if ($report && $panel) {
+      $report.addEventListener("click", (e) => {
+        e.preventDefault();
+        $panel.hidden = !$panel.hidden;
+        if (!$panel.hidden && $text) $text.focus();
+      });
+    }
+    if ($send) {
+      $send.addEventListener("click", () => {
+        const desc = ($text && $text.value || "").trim();
+        const $hint = document.getElementById("report-hint");
+        if (!desc) { if ($hint) $hint.textContent = "Add a quick description first."; return; }
+        if ($hint) $hint.textContent = "Opening your email app…";
+        window.location.href = buildReportMailto(course, filePath, desc);
+      });
+    }
+    // Wire the timeline compare control: fetch the picked offering and diff it.
+    const $cmp = document.getElementById("cmp-pick");
+    const $cmpResult = document.getElementById("cmp-result");
+    if ($cmp && $cmpResult) {
+      $cmp.addEventListener("change", async () => {
+        const file = $cmp.value;
+        if (!file) { $cmpResult.innerHTML = ""; return; }
+        $cmpResult.innerHTML = `<div class="cmp-loading">Loading…</div>`;
+        try {
+          const other = await loadCourseJson(file);
+          $cmpResult.innerHTML = renderOfferingDiff(computeOfferingDiff(course, other));
+        } catch (e) {
+          $cmpResult.innerHTML = `<div class="error">Could not load that offering: ${escapeHtml(e.message)}</div>`;
+        }
+      });
+    }
   } catch (err) {
     $root.innerHTML = `<div class="error">Error loading profile: ${escapeHtml(err.message)}</div>`;
     console.error(err);
   }
 }
 
-function renderCourseDetail($root, c, taxonomy) {
+// Build the per-course timeline widget. `others` is every OTHER offering of
+// this course (current + legacy), already sorted newest→oldest. The current
+// offering `c` is spliced into chronological position and marked. Legacy
+// offerings get an era badge; a title change between adjacent offerings is
+// flagged as an event (the course code was likely repurposed or renamed).
+function buildCourseTimeline(c, others, currentFile) {
+  others = others || [];
+  if (others.length === 0) return "";
+
+  // Assemble the full ordered list including the current offering.
+  const currentEntry = {
+    file: currentFile || getQueryParam("file"),
+    course_code: c.course_code,
+    course_title: c.course_title,
+    study_period: c.study_period,
+    year: c.year,
+    period: c.period,
+    system: c.system || (c.semester_code ? "current" : "legacy"),
+    _current: true,
+  };
+  const all = others.concat([currentEntry])
+    .sort((a, b) => offeringChronKey(b).localeCompare(offeringChronKey(a), undefined, { numeric: true }));
+
+  const span = `${semesterLabel(all[all.length - 1])} → ${semesterLabel(all[0])}`;
+  const nodes = all.map((o, i) => {
+    const label = semesterLabel(o);
+    const isLegacy = o.system === "legacy";
+    const cls = ["tl-node"];
+    if (o._current) cls.push("tl-current");
+    if (isLegacy) cls.push("tl-legacy");
+    // Title-change event: compare to the next-older offering in the list.
+    const older = all[i + 1];
+    let titleNote = "";
+    if (older && normTitle(older.course_title) !== normTitle(o.course_title)) {
+      titleNote = `<span class="tl-event" title="Title changed from “${escapeHtml(older.course_title || "")}”">title changed</span>`;
+    }
+    const eraTag = isLegacy ? `<span class="tl-era" title="Legacy profile (2009–S1 2024)">legacy</span>` : "";
+    const inner = `${escapeHtml(label)}${eraTag}`;
+    const body = o._current
+      ? `<span class="tl-node-label" title="Currently viewing — ${escapeHtml(o.course_title || "")}">${inner}</span>`
+      : `<a class="tl-node-label" href="course.html?file=${encodeURIComponent(o.file)}" title="${escapeHtml(o.course_title || "")}">${inner}</a>`;
+    return `<li class="${cls.join(" ")}">${body}${titleNote}</li>`;
+  }).join("");
+
+  // Compare control: pick any other offering to diff against the one on screen.
+  const cmpOptions = all.filter(o => !o._current).map(o =>
+    `<option value="${escapeHtml(o.file)}">${escapeHtml(semesterLabel(o))}${o.system === "legacy" ? " (legacy)" : ""}</option>`
+  ).join("");
+  const cmpHtml = `
+    <div class="tl-compare">
+      <label for="cmp-pick">Compare this offering with</label>
+      <select id="cmp-pick">
+        <option value="">— choose an offering —</option>
+        ${cmpOptions}
+      </select>
+    </div>
+    <div id="cmp-result" class="cmp-result" aria-live="polite"></div>
+  `;
+
+  return `
+    <div class="course-timeline" aria-label="Offerings of this course over time">
+      <div class="tl-head">
+        <span class="tl-title">Timeline</span>
+        <span class="tl-span">${escapeHtml(span)} · ${all.length} offering${all.length === 1 ? "" : "s"}</span>
+      </div>
+      <ol class="tl-track">${nodes}</ol>
+      ${cmpHtml}
+    </div>
+  `;
+}
+
+// Compute a structured diff between two full course profiles of the same course.
+// Always oriented older→newer (by chronological key) so "added"/"dropped" read
+// naturally as change over time. Assessment items are matched by normalised
+// title; weight and LO-set changes on matched items are reported.
+function computeOfferingDiff(profA, profB) {
+  // Orient: older first, newer second.
+  let older = profA, newer = profB;
+  if (offeringChronKey(profA).localeCompare(offeringChronKey(profB), undefined, { numeric: true }) > 0) {
+    older = profB; newer = profA;
+  }
+  const norm = s => normTitle(s || "");
+  const loSet = row => {
+    const refs = Array.isArray(row.learning_outcomes) ? row.learning_outcomes
+      : parseLoRefs(row.learning_outcomes_assessed || row.learning_outcomes || "");
+    return refs.map(x => String(x).replace(/^lo/i, "").replace(/\.$/, "")).filter(Boolean)
+      .map(Number).filter(n => !isNaN(n)).sort((a, b) => a - b);
+  };
+  const normWeight = w => String(w == null ? "" : w).replace(/\s+/g, " ").trim();
+
+  const aRows = older.assessment_summary || [];
+  const bRows = newer.assessment_summary || [];
+  const aByTitle = new Map(aRows.map(r => [norm(r.title), r]));
+  const bByTitle = new Map(bRows.map(r => [norm(r.title), r]));
+
+  const added = [], dropped = [], changed = [];
+  for (const r of bRows) {
+    if (!aByTitle.has(norm(r.title))) added.push({ title: r.title, weight: r.weight });
+  }
+  for (const r of aRows) {
+    if (!bByTitle.has(norm(r.title))) dropped.push({ title: r.title, weight: r.weight });
+  }
+  for (const r of bRows) {
+    const a = aByTitle.get(norm(r.title));
+    if (!a) continue;
+    const wOld = normWeight(a.weight), wNew = normWeight(r.weight);
+    const loOld = loSet(a), loNew = loSet(r);
+    const weightChanged = wOld !== wNew;
+    const loChanged = JSON.stringify(loOld) !== JSON.stringify(loNew);
+    if (weightChanged || loChanged) {
+      changed.push({
+        title: r.title,
+        weight: weightChanged ? { from: a.weight, to: r.weight } : null,
+        los: loChanged ? { from: loOld, to: loNew } : null,
+      });
+    }
+  }
+
+  const loCountOld = (older.learning_outcomes || []).length;
+  const loCountNew = (newer.learning_outcomes || []).length;
+  const titleChanged = norm(older.course_title) !== norm(newer.course_title);
+
+  return {
+    older, newer, added, dropped, changed,
+    loCount: loCountOld !== loCountNew ? { from: loCountOld, to: loCountNew } : null,
+    title: titleChanged ? { from: older.course_title, to: newer.course_title } : null,
+    identical: !added.length && !dropped.length && !changed.length && loCountOld === loCountNew && !titleChanged,
+  };
+}
+
+// Render an offering diff (from computeOfferingDiff) to HTML.
+function renderOfferingDiff(diff) {
+  const oLab = semesterLabel(diff.older), nLab = semesterLabel(diff.newer);
+  const head = `<div class="cmp-head"><strong>${escapeHtml(oLab)}</strong> → <strong>${escapeHtml(nLab)}</strong></div>`;
+  if (diff.identical) {
+    return `<div class="cmp-panel">${head}<div class="cmp-none">No changes to title, learning outcomes count, or assessment items between these two offerings.</div></div>`;
+  }
+  const blocks = [];
+  if (diff.title) {
+    blocks.push(`<div class="cmp-row cmp-meta"><span class="cmp-tag">title</span> “${escapeHtml(diff.title.from || "")}” → “${escapeHtml(diff.title.to || "")}”</div>`);
+  }
+  if (diff.loCount) {
+    blocks.push(`<div class="cmp-row cmp-meta"><span class="cmp-tag">LOs</span> ${diff.loCount.from} → ${diff.loCount.to} learning outcomes</div>`);
+  }
+  for (const a of diff.added) {
+    blocks.push(`<div class="cmp-row cmp-add"><span class="cmp-tag">added</span> ${escapeHtml(a.title || "")}${a.weight ? ` <span class="cmp-w">(${escapeHtml(a.weight)})</span>` : ""}</div>`);
+  }
+  for (const d of diff.dropped) {
+    blocks.push(`<div class="cmp-row cmp-drop"><span class="cmp-tag">dropped</span> ${escapeHtml(d.title || "")}${d.weight ? ` <span class="cmp-w">(${escapeHtml(d.weight)})</span>` : ""}</div>`);
+  }
+  for (const ch of diff.changed) {
+    const bits = [];
+    if (ch.weight) bits.push(`weight ${escapeHtml(String(ch.weight.from || "—"))} → ${escapeHtml(String(ch.weight.to || "—"))}`);
+    if (ch.los) bits.push(`LOs ${ch.los.from.length ? "LO" + ch.los.from.join(", LO") : "—"} → ${ch.los.to.length ? "LO" + ch.los.to.join(", LO") : "—"}`);
+    blocks.push(`<div class="cmp-row cmp-chg"><span class="cmp-tag">changed</span> ${escapeHtml(ch.title || "")} <span class="cmp-w">${bits.join(" · ")}</span></div>`);
+  }
+  return `<div class="cmp-panel">${head}${blocks.join("")}</div>`;
+}
+
+// Build a mailto: link for an error report, with the exact course/offering
+// location baked into the body so a fix can be pinpointed (often an LO-mapping gap).
+function buildReportMailto(c, filePath, description) {
+  const to = SITE.reportEmail || "uqsmitc6@uq.edu.au";
+  const code = c.full_course_code || c.course_code || "";
+  const sem = semesterLabel(c);
+  const subject = `Course profile error: ${c.course_code || ""} (${sem})`;
+  const pageUrl = (typeof location !== "undefined" && location.href) || "";
+  const body = [
+    "Reported from the UQ Course Profiles viewer.",
+    "",
+    "What's wrong:",
+    description || "(describe here)",
+    "",
+    "— Pinpoint (please leave this in) —",
+    `Course: ${c.course_code || ""} — ${c.course_title || ""}`,
+    `Full code: ${code}`,
+    `Semester: ${sem} (${c.semester_code || c.period || ""})`,
+    `Class no.: ${c.class_code || ""}`,
+    `File: ${filePath || ""}`,
+    `Page: ${pageUrl}`,
+    `Edition: ${EDITION}`,
+  ].join("\n");
+  return `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+}
+
+function renderCourseDetail($root, c, taxonomy, otherOfferings, currentFile) {
+  // Default for backward compat
+  otherOfferings = otherOfferings || [];
   const roles = taxonomy ? programRolesFor(c.course_code, taxonomy) : [];
   const progChips = roles.map(r => {
     const isCore = (r.role || "").toLowerCase() === "core";
@@ -800,20 +1453,41 @@ function renderCourseDetail($root, c, taxonomy) {
 
   const parts = [];
 
+  // Per-course timeline: every offering across both systems (current + legacy),
+  // ordered newest→oldest, with the current one marked and title-change events
+  // surfaced so a repurposed course code is visible rather than hidden.
+  const semPickerHtml = buildCourseTimeline(c, otherOfferings, currentFile);
+
   // Header card
-  const filePath = getQueryParam("file");
-  const rawJsonLink = filePath ? `<a href="./${escapeHtml(filePath)}" target="_blank" rel="noopener">Raw JSON ↗</a>` : "";
+  const filePath = currentFile || getQueryParam("file");
+  const rawJsonLink = filePath ? `<a href="${escapeHtml(dataUrl(filePath))}" target="_blank" rel="noopener">Raw JSON ↗</a>` : "";
+  // Legacy provenance badge — make clear a pre-cutover profile is being viewed,
+  // so a 2011 ECP is never mistaken for current.
+  const isLegacy = c.system === "legacy" || (c.url || "").includes("archive.course-profiles.uq.edu.au");
+  const legacyBadge = isLegacy
+    ? `<span class="era-badge" title="Archived profile from the legacy course-profiles system (2009–S1 2024). LO-to-assessment mappings are rendered as originally published.">Legacy profile · ${escapeHtml(semesterLabel(c))}</span>`
+    : "";
   parts.push(`
     <div class="course-header">
-      <div><span class="code">${escapeHtml(c.full_course_code || c.course_code)}</span></div>
+      <div><span class="code">${escapeHtml(c.full_course_code || c.course_code)}</span> ${legacyBadge}</div>
       <h1>${escapeHtml(c.course_code || "")} — ${escapeHtml(c.course_title || "")}</h1>
       <div class="meta">
         ${escapeHtml(c.study_level || "")} · ${escapeHtml(c.units || "")} ·
         ${escapeHtml(c.attendance_mode || "")} · ${escapeHtml(c.location || "")}
         ${c.url ? ` · <a href="${escapeHtml(c.url)}" target="_blank" rel="noopener">View on course-profiles.uq.edu.au ↗</a>` : ""}
         ${rawJsonLink ? ` · ${rawJsonLink}` : ""}
+        · <a href="#" id="report-error" title="Report something wrong on this page">Report an error ⚑</a>
       </div>
       <div class="meta small" style="margin-top:4px">Last scraped: ${escapeHtml(fmtDate(c.scraped_at))}</div>
+      <div id="report-panel" class="report-panel" hidden>
+        <p class="small">Spotted something wrong — a learning-outcome mapping, an assessment detail, anything? Describe it and we'll open an email with the exact location pre-filled.</p>
+        <textarea id="report-text" rows="3" placeholder="e.g. The final exam should map to learning outcomes 2 and 4, not just 2."></textarea>
+        <div class="report-actions">
+          <button id="report-send" class="dl-btn" type="button">Compose email ✉</button>
+          <span id="report-hint" class="small muted"></span>
+        </div>
+      </div>
+      ${semPickerHtml}
       ${progChips ? `<div style="margin-top:10px">${progChips}</div>` : ""}
     </div>
   `);
@@ -904,7 +1578,7 @@ function renderCourseDetail($root, c, taxonomy) {
       <div class="card">
         <h2>Learning outcomes</h2>
         ${c.learning_outcomes.map(lo => {
-          const code = lo.code || (lo.number != null ? `LO${lo.number}` : "");
+          const code = loDisplayCode(lo);
           return `
             <div class="lo-item">
               <div class="lo-code">${escapeHtml(code)}</div>
@@ -916,25 +1590,79 @@ function renderCourseDetail($root, c, taxonomy) {
     `);
   }
 
-  // Assessment summary
+  // Assessment summary — merge LO mapping from assessment_details when
+  // the summary rows don't carry it directly.
   if (c.assessment_summary && c.assessment_summary.length) {
-    const rows = c.assessment_summary.map(a => `
-      <tr>
-        <td><b>${escapeHtml(a.title || "")}</b>
-          ${a.conditions && a.conditions.length ? `<span class="conditions">${a.conditions.map(escapeHtml).join(" · ")}</span>` : ""}
-        </td>
-        <td class="nowrap">${escapeHtml(a.category || a.type || "")}</td>
-        <td class="weight nowrap">${escapeHtml(a.weighting || a.weight || "")}</td>
-        <td>${escapeHtml(a.due_date || a.due || "")}</td>
-        <td>${a.learning_outcomes && a.learning_outcomes.length ? a.learning_outcomes.map(escapeHtml).join(", ") : ""}</td>
-      </tr>
-    `).join("");
+    const loMap = buildAssessmentLoMap(c);
+    const ovMap = getLoOverrideMap(c.course_code, c.semester_code, c.class_code);
+    // Resolve the LO list for one assessment row: override wins, then any LOs
+    // carried on the summary row, then the scraped assessment-details map.
+    const resolveLos = (a) => {
+      const title = (a.title || "").trim();
+      const ov = ovMap[normTitle(title)];
+      if (ov) return { los: ov.los, override: true, notes: ov.notes };
+      if (a.learning_outcomes && a.learning_outcomes.length) return { los: a.learning_outcomes, override: false };
+      if (title && loMap[title]) return { los: loMap[title], override: false };
+      return { los: [], override: false };
+    };
+    const resolved = c.assessment_summary.map(resolveLos);
+    const hasAnyLos = resolved.some(r => r.los && r.los.length);
+    const anyOverride = resolved.some(r => r.override);
+    const loHeader = hasAnyLos ? `<th>LOs</th>` : "";
+    const rows = c.assessment_summary.map((a, i) => {
+      const { los, override, notes } = resolved[i];
+      const chips = los.length
+        ? los.map(x => `<span class="lo-chip${override ? " override" : ""}"${override ? ` title="From Jac, the authored curriculum record — omitted from the published profile${notes ? ": " + escapeHtml(notes) : ""}"` : ""}>${escapeHtml(x)}</span>`).join(" ")
+        : "—";
+      const mark = override ? ` <span class="lo-override-mark" title="From Jac, the authored curriculum record — omitted from the published profile by a publishing fault">Jac</span>` : "";
+      const loCell = hasAnyLos ? `<td class="lo-list">${chips}${mark}</td>` : "";
+      return `
+        <tr>
+          <td><b>${escapeHtml(a.title || "")}</b>
+            ${a.conditions && a.conditions.length ? `<span class="conditions">${a.conditions.map(escapeHtml).join(" · ")}</span>` : ""}
+          </td>
+          <td class="nowrap">${escapeHtml(a.category || a.type || "")}</td>
+          <td class="weight nowrap">${escapeHtml(a.weighting || a.weight || "")}</td>
+          <td>${escapeHtml(a.due_date || a.due || "")}</td>
+          ${loCell}
+        </tr>
+      `;
+    }).join("");
+    const legend = anyOverride
+      ? `<p class="lo-override-legend">Mappings marked <span class="lo-override-mark">Jac</span> are from the authored curriculum record in Jac. UQ's published profile omits them due to a publishing fault.</p>`
+      : "";
     parts.push(`
       <div class="card">
         <h2>Assessment</h2>
         <table class="assessment">
-          <thead><tr><th>Task</th><th>Category</th><th>Weight</th><th>Due</th><th>LOs</th></tr></thead>
+          <thead><tr><th>Task</th><th>Category</th><th>Weight</th><th>Due</th>${loHeader}</tr></thead>
           <tbody>${rows}</tbody>
+        </table>
+        ${legend}
+      </div>
+    `);
+  }
+
+  // AoL status card
+  const aolEntries = STORE.aol ? getAolForCourse(STORE.aol, c.course_code) : [];
+  if (aolEntries.length) {
+    const aolRows = aolEntries.map(e => {
+      const statusInfo = AOL_STATUS[e.status] || { label: e.status, icon: "?", cls: "" };
+      return `<tr>
+        <td>${escapeHtml(e.semester_label || e.semester_code)}</td>
+        <td>${aolGaChip(e.ga)}</td>
+        <td>${escapeHtml(e.assessment_title)}</td>
+        <td><span class="aol-chip ${statusInfo.cls}">${statusInfo.icon} ${escapeHtml(statusInfo.label)}</span></td>
+        <td>${e.rubric_url ? `<a href="${escapeHtml(e.rubric_url)}" target="_blank" rel="noopener">View rubric ↗</a>` : '<span class="muted">—</span>'}</td>
+        <td class="muted small">${escapeHtml(e.notes || "")}</td>
+      </tr>`;
+    }).join("");
+    parts.push(`
+      <div class="card aol-card">
+        <h2>Assurance of Learning</h2>
+        <table class="assessment">
+          <thead><tr><th>Semester</th><th>GA</th><th>Assessment</th><th>Status</th><th>Rubric</th><th>Notes</th></tr></thead>
+          <tbody>${aolRows}</tbody>
         </table>
       </div>
     `);
@@ -942,10 +1670,11 @@ function renderCourseDetail($root, c, taxonomy) {
 
   // Assessment details
   if (c.assessment_details && c.assessment_details.length) {
+    const ovMapDetail = getLoOverrideMap(c.course_code, c.semester_code, c.class_code);
     parts.push(`
       <div class="card">
         <h2>Assessment details</h2>
-        ${c.assessment_details.map(renderAssessmentDetail).join("")}
+        ${c.assessment_details.map(a => renderAssessmentDetail(a, ovMapDetail)).join("")}
       </div>
     `);
   }
@@ -1058,7 +1787,7 @@ function renderCourseDetail($root, c, taxonomy) {
   $root.innerHTML = parts.join("");
 }
 
-function renderAssessmentDetail(a) {
+function renderAssessmentDetail(a, ovMap) {
   const meta = [];
   if (a.weighting || a.weight) meta.push(`<b>Weight:</b> ${escapeHtml(a.weighting || a.weight)}`);
   if (a.due_date || a.due) meta.push(`<b>Due:</b> ${escapeHtml(a.due_date || a.due)}`);
@@ -1066,11 +1795,18 @@ function renderAssessmentDetail(a) {
   if (a.mode) meta.push(`<b>Mode:</b> ${escapeHtml(a.mode)}`);
   if (a.other_conditions) meta.push(`<b>Conditions:</b> ${escapeHtml(a.other_conditions)}`);
 
-  // Learning outcomes assessed — can be string ("L01, L02") or list
-  const loField = a.learning_outcomes_assessed != null ? a.learning_outcomes_assessed : a.learning_outcomes;
-  let loStr = "";
-  if (Array.isArray(loField)) loStr = loField.map(x => String(x)).join(", ");
-  else if (loField) loStr = String(loField);
+  // Learning outcomes assessed — a manual override (if present) is the
+  // authoritative list; otherwise use the scraped value ("L01, L02" or list).
+  const ov = ovMap ? ovMap[normTitle(a.title)] : null;
+  let loStr = "", loOverride = false;
+  if (ov) {
+    loStr = ov.los.join(", ");
+    loOverride = true;
+  } else {
+    const loField = a.learning_outcomes_assessed != null ? a.learning_outcomes_assessed : a.learning_outcomes;
+    if (Array.isArray(loField)) loStr = loField.map(x => String(x)).join(", ");
+    else if (loField) loStr = String(loField);
+  }
 
   // Special indicators (list of strings)
   let indicators = "";
@@ -1103,7 +1839,7 @@ function renderAssessmentDetail(a) {
       <h4>${escapeHtml(a.title || a.name || "Assessment")}</h4>
       ${meta.length ? `<div class="a-meta">${meta.join(" · ")}</div>` : ""}
       ${indicators ? `<div style="margin-bottom:8px">${indicators}</div>` : ""}
-      ${loStr ? `<div class="small muted">Linked LOs: ${escapeHtml(loStr)}</div>` : ""}
+      ${loStr ? `<div class="small muted">Linked LOs: ${escapeHtml(loStr)}${loOverride ? ` <span class="lo-override-mark" title="From Jac, the authored curriculum record — omitted from the published profile by a publishing fault">Jac</span>` : ""}</div>` : ""}
       ${sections.join("")}
     </div>
   `;
@@ -1138,10 +1874,11 @@ async function initProgram() {
   const progKey = getQueryParam("program");
 
   try {
-    const [manifest, taxonomy] = await Promise.all([loadManifest(), loadTaxonomy()]);
+    const [manifest, taxonomy, aol] = await Promise.all([loadManifest(), loadTaxonomy(), loadAol().catch(() => null), loadTeachingPeriods().catch(() => null)]);
     const courses = getAllCourses(manifest);
     STORE.allCourses = courses;
     STORE.taxonomy = taxonomy;
+    STORE.aol = aol;
 
     if (!progKey) {
       renderProgramIndex($root, taxonomy, courses);
@@ -1159,16 +1896,17 @@ function renderProgramIndex($root, taxonomy, courses) {
   const coursesByCode = {};
   for (const c of courses) coursesByCode[c.course_code] = c;
 
-  const items = Object.entries(taxonomy.programs).map(([key, p]) => {
-    const mapped = Object.values(taxonomy.course_programs || {}).flat().filter(x => x.program === key);
+  const programEntries = Object.entries(taxonomy.programs).filter(([, p]) => p.is_programme !== false);
+  const items = programEntries.map(([key, p]) => {
     const scrapedCount = Object.entries(taxonomy.course_programs || {}).filter(([code, roles]) => {
       return roles.some(r => r.program === key) && coursesByCode[code];
     }).length;
+    const codeLabel = p.program_code ? ` · ${p.program_code}` : "";
     return `
       <a class="program-card" href="program.html?program=${encodeURIComponent(key)}" style="display:block">
         <div class="level">${escapeHtml(p.level || "")}</div>
         <h3>${escapeHtml(p.name || key)}</h3>
-        <div class="muted small">${escapeHtml(key)}</div>
+        <div class="muted small">${escapeHtml(key)}${escapeHtml(codeLabel)}</div>
         <div class="count">${scrapedCount} course${scrapedCount === 1 ? "" : "s"} with scraped profile${scrapedCount === 1 ? "" : "s"}</div>
       </a>
     `;
@@ -1176,7 +1914,7 @@ function renderProgramIndex($root, taxonomy, courses) {
 
   $root.innerHTML = `
     <h1>Programs</h1>
-    <p class="subtitle">${Object.keys(taxonomy.programs).length} UQBS programs. Click through to see core and majors.</p>
+    <p class="subtitle">${programEntries.length} UQBS programs. Click through to see core and majors.</p>
     <div class="program-list">${items}</div>
   `;
 }
@@ -1195,61 +1933,297 @@ function renderProgramDetail($root, progKey, taxonomy, courses) {
     const c = coursesByCode[code];
     const pfx = coursePrefix(code);
     const codeCls = pfx ? `code prefix-${pfx}` : "code";
+    const courseAol = STORE.aol ? getAolForCourse(STORE.aol, code) : [];
+    const aolTd = courseAol.length
+      ? `<td class="aol-col">${courseAol.map(e => `<span class="aol-chip ${(AOL_STATUS[e.status] || {}).cls || ''}" title="${escapeHtml((AOL_STATUS[e.status] || {}).label || e.status)}: ${escapeHtml(e.assessment_title)}">${escapeHtml(e.ga)}</span>`).join(" ")}</td>`
+      : `<td class="aol-col"></td>`;
     if (c) {
       return `<tr>
         <td class="${codeCls}"><a href="course.html?file=${encodeURIComponent(c.file)}">${escapeHtml(code)}</a></td>
         <td>${escapeHtml(c.course_title || "")}</td>
         <td>${escapeHtml(c.units || "")}</td>
         <td>${escapeHtml(c.attendance_mode || "")}</td>
+        ${aolTd}
       </tr>`;
     }
     return `<tr>
       <td class="${codeCls} muted">${escapeHtml(code)}</td>
       <td class="muted"><em>not in current scrape</em></td>
       <td></td><td></td>
+      ${aolTd}
     </tr>`;
   }
 
+  const codeLabel = p.program_code ? ` · ${p.program_code}` : "";
   const parts = [`
     <a href="program.html" class="small">← All programs</a>
     <h1 style="margin-top:8px">${escapeHtml(p.name)}</h1>
-    <p class="subtitle">${escapeHtml(progKey)} · ${escapeHtml(p.level || "")}</p>
+    <p class="subtitle">${escapeHtml(progKey)}${escapeHtml(codeLabel)} · ${escapeHtml(p.level || "")}</p>
   `];
 
-  if (p.core && p.core.length) {
+  // Pathway info (for Grad Certs)
+  if (p.pathway_to) {
+    const dest = taxonomy.programs[p.pathway_to];
+    const destName = dest ? dest.name : p.pathway_to;
+    parts.push(`<p class="muted small" style="margin-top:-8px">Pathway to: <a href="program.html?program=${encodeURIComponent(p.pathway_to)}">${escapeHtml(destName)}</a></p>`);
+  }
+
+  // Helper: render a named course-list section
+  function renderSection(title, codes) {
+    if (!codes || !codes.length) return;
     parts.push(`
       <div class="card">
-        <h2>Core courses <span class="muted small">(${p.core.length})</span></h2>
+        <h2>${escapeHtml(title)} <span class="muted small">(${codes.length})</span></h2>
         <table class="assessment">
-          <thead><tr><th>Code</th><th>Title</th><th>Units</th><th>Mode</th></tr></thead>
-          <tbody>${p.core.map(renderCourseRow).join("")}</tbody>
+          <thead><tr><th>Code</th><th>Title</th><th>Units</th><th>Mode</th><th>AoL</th></tr></thead>
+          <tbody>${codes.map(renderCourseRow).join("")}</tbody>
         </table>
       </div>
     `);
   }
 
+  renderSection("Core courses", p.core);
+  renderSection("Foundational courses", p.foundational_courses);
+  renderSection("Flexible core", p.flexible_core);
+  renderSection("Flexible core A", p.flexible_core_a);
+  renderSection("Flexible core B", p.flexible_core_b);
+  renderSection("Capstone", p.capstone);
+  renderSection("Program electives", p.program_electives);
+  renderSection("Research courses", p.research_courses);
+  renderSection("Advanced courses", p.advanced_courses);
+  renderSection("General pathway courses", p.general_pathway_courses);
+  renderSection("Pathway prerequisites", p.pathway_prerequisites);
+
   if (p.majors && Object.keys(p.majors).length) {
-    parts.push(`<h2>Majors</h2>`);
+    // Use contextual heading based on programme level
+    const majorHeading = (p.level === "PG") ? "Fields / Specialisations" : "Majors";
+    parts.push(`<h2>${majorHeading}</h2>`);
     for (const [major, codes] of Object.entries(p.majors)) {
-      parts.push(`
-        <div class="card major-section">
-          <h3>${escapeHtml(major)} <span class="muted small">(${codes.length})</span></h3>
-          <table class="assessment">
-            <thead><tr><th>Code</th><th>Title</th><th>Units</th><th>Mode</th></tr></thead>
-            <tbody>${codes.map(renderCourseRow).join("")}</tbody>
-          </table>
-        </div>
-      `);
+      if (!codes.length) {
+        parts.push(`
+          <div class="card major-section">
+            <h3>${escapeHtml(major)} <span class="muted small">(no courses listed)</span></h3>
+            <p class="muted small"><em>Course list not available — see my.UQ for details.</em></p>
+          </div>
+        `);
+      } else {
+        parts.push(`
+          <div class="card major-section">
+            <h3>${escapeHtml(major)} <span class="muted small">(${codes.length})</span></h3>
+            <table class="assessment">
+              <thead><tr><th>Code</th><th>Title</th><th>Units</th><th>Mode</th></tr></thead>
+              <tbody>${codes.map(renderCourseRow).join("")}</tbody>
+            </table>
+          </div>
+        `);
+      }
     }
   }
 
   if (p.electives && p.electives.length) {
+    renderSection("Electives", p.electives);
+  }
+
+  $root.innerHTML = parts.join("");
+}
+
+// =========================================================================
+// Display mode — one control cycling Auto → Light → Dark → Fun.
+// "Fun" is the dark-neon theme; Auto/Light/Dark are the classic theme with the
+// matching palette. Shared across all pages and both editions.
+// =========================================================================
+const MODES = ["auto", "light", "dark", "fun"];
+const MODE_LABELS = { auto: "Auto", light: "Light", dark: "Dark", fun: "Fun" };
+const MODE_ICONS = { auto: "☾", light: "☀", dark: "●", fun: "✦" };
+const MODE_STORAGE_KEY = "uqbs-mode";
+
+function getMode() {
+  try {
+    const stored = localStorage.getItem(MODE_STORAGE_KEY);
+    if (MODES.includes(stored)) return stored;
+  } catch (_) { /* ignore */ }
+  if (document.documentElement.getAttribute("data-theme") === "fun") return "fun";
+  const cm = document.documentElement.getAttribute("data-color-mode");
+  return MODES.includes(cm) ? cm : "auto";
+}
+
+function applyMode(mode) {
+  if (!MODES.includes(mode)) mode = "auto";
+  const root = document.documentElement;
+  if (mode === "fun") {
+    root.setAttribute("data-theme", "fun");
+    root.removeAttribute("data-color-mode");
+  } else {
+    root.setAttribute("data-theme", "classic");
+    if (mode === "light" || mode === "dark") root.setAttribute("data-color-mode", mode);
+    else root.removeAttribute("data-color-mode");
+  }
+  try { localStorage.setItem(MODE_STORAGE_KEY, mode); } catch (_) { /* ignore */ }
+  updateModeButton(mode);
+}
+
+function updateModeButton(mode) {
+  const $btn = document.getElementById("mode-toggle");
+  if (!$btn) return;
+  const $label = $btn.querySelector(".mt-label");
+  const $icon = $btn.querySelector(".mt-icon");
+  if ($label) $label.textContent = MODE_LABELS[mode];
+  if ($icon) $icon.textContent = MODE_ICONS[mode];
+  const next = MODES[(MODES.indexOf(mode) + 1) % MODES.length];
+  $btn.title = `Display: ${MODE_LABELS[mode]} (click for ${MODE_LABELS[next]})`;
+  $btn.setAttribute("aria-label", `Display mode: ${MODE_LABELS[mode]}. Click to switch to ${MODE_LABELS[next]}.`);
+}
+
+function initMode() {
+  updateModeButton(getMode());
+  const $btn = document.getElementById("mode-toggle");
+  if ($btn && !$btn.dataset.modeBound) {
+    $btn.dataset.modeBound = "1";
+    $btn.addEventListener("click", () => {
+      const cur = getMode();
+      applyMode(MODES[(MODES.indexOf(cur) + 1) % MODES.length]);
+    });
+  }
+}
+
+if (typeof document !== "undefined") {
+  initMode();
+}
+
+// =========================================================================
+// Page: AOL DASHBOARD (aol.html)
+// =========================================================================
+async function initAol() {
+  const $root = document.getElementById("aol-root");
+  try {
+    const [manifest, taxonomy, aol] = await Promise.all([
+      loadManifest(), loadTaxonomy(), loadAol(), loadTeachingPeriods().catch(() => null)
+    ]);
+    STORE.allCourses = getAllCourses(manifest);
+    STORE.taxonomy = taxonomy;
+    STORE.aol = aol;
+    renderAolDashboard($root, aol, taxonomy, STORE.allCourses);
+  } catch (err) {
+    $root.innerHTML = `<div class="error">Error: ${escapeHtml(err.message)}</div>`;
+    console.error(err);
+  }
+}
+
+function renderAolDashboard($root, aol, taxonomy, courses) {
+  if (!aol || !aol.semesters || !Object.keys(aol.semesters).length) {
+    $root.innerHTML = `
+      <h1>Assurance of Learning Dashboard</h1>
+      <div class="card"><p>No AoL data loaded. Add entries to <code>taxonomy/aol-template.csv</code> and run <code>python scraper/import_aol.py</code>.</p></div>
+    `;
+    return;
+  }
+
+  const coursesByCode = {};
+  for (const c of courses) coursesByCode[c.course_code] = c;
+
+  const parts = [];
+  parts.push(`<h1>Assurance of Learning Dashboard</h1>`);
+
+  // Summary stats across all semesters
+  const allEntries = [];
+  for (const [sem, data] of Object.entries(aol.semesters)) {
+    for (const e of (data.entries || [])) {
+      allEntries.push({ ...e, semester_code: sem, semester_label: data.label });
+    }
+  }
+
+  const statusCounts = {};
+  const gaCounts = {};
+  const uniqueCourses = new Set();
+  for (const e of allEntries) {
+    statusCounts[e.status] = (statusCounts[e.status] || 0) + 1;
+    gaCounts[e.ga] = (gaCounts[e.ga] || 0) + 1;
+    uniqueCourses.add(e.course_code);
+  }
+
+  parts.push(`
+    <div class="stat-bar">
+      <div class="stat"><b>${allEntries.length}</b><span>AoL entries</span></div>
+      <div class="stat"><b>${uniqueCourses.size}</b><span>courses with AoL</span></div>
+      <div class="stat"><b>${Object.keys(aol.semesters).length}</b><span>semester${Object.keys(aol.semesters).length === 1 ? '' : 's'}</span></div>
+    </div>
+  `);
+
+  // Status summary cards
+  const statusOrder = ["tbd", "identified", "rubric_in_dev", "active", "established"];
+  const statusCards = statusOrder.map(s => {
+    const info = AOL_STATUS[s] || {};
+    const count = statusCounts[s] || 0;
+    return `<div class="aol-stat-card ${info.cls || ''}"><div class="aol-stat-icon">${info.icon || '?'}</div><div class="aol-stat-count">${count}</div><div class="aol-stat-label">${escapeHtml(info.label || s)}</div></div>`;
+  }).join("");
+  parts.push(`<div class="aol-status-summary">${statusCards}</div>`);
+
+  // Per-semester sections
+  for (const [sem, data] of Object.entries(aol.semesters).sort(([a],[b]) => b.localeCompare(a))) {
+    const entries = data.entries || [];
+    if (!entries.length) continue;
+
+    // Group by programme (via taxonomy)
+    const byProg = {};
+    const noProg = [];
+    for (const e of entries) {
+      const progRoles = taxonomy && taxonomy.course_programs ? (taxonomy.course_programs[e.course_code] || []) : [];
+      if (progRoles.length) {
+        for (const r of progRoles) {
+          byProg[r.program] = byProg[r.program] || [];
+          byProg[r.program].push(e);
+        }
+      } else {
+        noProg.push(e);
+      }
+    }
+
+    parts.push(`<h2>${escapeHtml(data.label || sem)}</h2>`);
+
+    // GA coverage heatmap for this semester
+    const gaNames = aol._metadata?.graduate_attributes || {};
+    const gas = ["GA1", "GA2", "GA3", "GA4", "GA5", "GA6"];
+    const semGaCounts = {};
+    for (const e of entries) {
+      semGaCounts[e.ga] = (semGaCounts[e.ga] || 0) + 1;
+    }
+    const gaHeatRow = gas.map(g => {
+      const n = semGaCounts[g] || 0;
+      const label = gaNames[g] || g;
+      const intensity = n === 0 ? "aol-heat-0" : n <= 2 ? "aol-heat-1" : n <= 4 ? "aol-heat-2" : "aol-heat-3";
+      return `<td class="aol-heat ${intensity}" title="${escapeHtml(label)}: ${n} course${n === 1 ? '' : 's'}">${g}<br><b>${n}</b></td>`;
+    }).join("");
     parts.push(`
       <div class="card">
-        <h2>Electives <span class="muted small">(${p.electives.length})</span></h2>
-        <table class="assessment">
-          <thead><tr><th>Code</th><th>Title</th><th>Units</th><th>Mode</th></tr></thead>
-          <tbody>${p.electives.map(renderCourseRow).join("")}</tbody>
+        <h3 style="margin-top:0">GA Coverage</h3>
+        <table class="aol-heatmap"><tr>${gaHeatRow}</tr></table>
+      </div>
+    `);
+
+    // Full entry table for this semester
+    const rows = entries.map(e => {
+      const info = AOL_STATUS[e.status] || {};
+      const c = coursesByCode[e.course_code];
+      const courseLink = c ? `<a href="course.html?file=${encodeURIComponent(c.file)}">${escapeHtml(e.course_code)}</a>` : escapeHtml(e.course_code);
+      const progRoles = taxonomy && taxonomy.course_programs ? (taxonomy.course_programs[e.course_code] || []) : [];
+      const progChips = progRoles.slice(0, 2).map(r => `<span class="chip">${escapeHtml(r.program)}</span>`).join(" ");
+      return `<tr>
+        <td class="code">${courseLink}</td>
+        <td>${c ? escapeHtml(c.course_title || '') : '<span class="muted">—</span>'}</td>
+        <td>${aolGaChip(e.ga)}</td>
+        <td>${escapeHtml(e.assessment_title)}</td>
+        <td><span class="aol-chip ${info.cls || ''}">${info.icon || ''} ${escapeHtml(info.label || e.status)}</span></td>
+        <td>${e.rubric_url ? `<a href="${escapeHtml(e.rubric_url)}" target="_blank" rel="noopener">Rubric ↗</a>` : ''}</td>
+        <td>${progChips}</td>
+      </tr>`;
+    }).join("");
+
+    parts.push(`
+      <div class="card">
+        <h3 style="margin-top:0">All AoL Entries</h3>
+        <table class="assessment aol-table">
+          <thead><tr><th>Code</th><th>Title</th><th>GA</th><th>Assessment</th><th>Status</th><th>Rubric</th><th>Programs</th></tr></thead>
+          <tbody>${rows}</tbody>
         </table>
       </div>
     `);
@@ -1259,65 +2233,197 @@ function renderProgramDetail($root, progKey, taxonomy, courses) {
 }
 
 // =========================================================================
-// Theme toggle (Classic ⇄ Fun), shared across all pages
+// Page: ALL-OF-UQ BROWSER (browse-all.html)
 // =========================================================================
-const THEMES = ["classic", "fun"];
-const THEME_LABELS = { classic: "Classic", fun: "Fun" };
-const THEME_ICONS = { classic: "◐", fun: "✦" };
-const THEME_STORAGE_KEY = "uqbs-theme";
+async function initAllBrowser() {
+  const $body = document.getElementById("courses-body");
+  const $count = document.getElementById("course-count");
+  const $meta = document.getElementById("meta-info");
+  try {
+    const [manifest] = await Promise.all([loadManifestAll(), loadTeachingPeriods().catch(() => null)]);
+    const courses = getAllCourses(manifest);
+    STORE.allCourses = courses;
+    // No taxonomy or AoL for all-of-UQ view
+    STORE.taxonomy = null;
+    STORE.aol = null;
+    $meta.innerHTML = `<span>Scrape generated</span> <b>${escapeHtml(fmtDate(manifest.generated_at))}</b> <span>· ${manifest.total_profiles} profiles</span>`;
 
-function getCurrentTheme() {
-  const t = document.documentElement.getAttribute("data-theme");
-  return THEMES.includes(t) ? t : "classic";
-}
+    // Populate filter dropdowns
+    populateSelect("filter-level", uniqueSorted(courses.map(c => c.study_level)));
+    populateSelect("filter-mode", uniqueSorted(courses.map(c => c.attendance_mode)));
+    populateSelect("filter-location", uniqueSorted(courses.map(c => c.location)));
+    populateSelect("filter-school", uniqueSorted(courses.map(c => c.coordinating_unit)));
 
-function applyTheme(theme) {
-  if (!THEMES.includes(theme)) theme = "classic";
-  document.documentElement.setAttribute("data-theme", theme);
-  try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch (_) { /* ignore */ }
-  updateThemeToggleLabel(theme);
-}
-
-function updateThemeToggleLabel(theme) {
-  const $btn = document.getElementById("theme-toggle");
-  if (!$btn) return;
-  // Button shows the theme you'll switch TO, to make it obvious what happens
-  const next = theme === "classic" ? "fun" : "classic";
-  const $label = $btn.querySelector(".tt-label");
-  const $icon = $btn.querySelector(".tt-icon");
-  if ($label) $label.textContent = THEME_LABELS[next];
-  if ($icon) $icon.textContent = THEME_ICONS[next];
-  $btn.setAttribute("aria-pressed", theme === "fun" ? "true" : "false");
-  $btn.title = `Switch to ${THEME_LABELS[next]} theme`;
-}
-
-function initTheme() {
-  // The inline <script> in <head> has already applied the data-theme attribute
-  // for FOUC prevention. Here we just wire the toggle button.
-  const current = getCurrentTheme();
-  updateThemeToggleLabel(current);
-  const $btn = document.getElementById("theme-toggle");
-  if ($btn && !$btn.dataset.themeBound) {
-    $btn.dataset.themeBound = "1";
-    $btn.addEventListener("click", () => {
-      const next = getCurrentTheme() === "classic" ? "fun" : "classic";
-      applyTheme(next);
+    // Populate semester filter and default to most recent
+    const semCodes = uniqueSorted(courses.map(c => c.semester_code));
+    const semOpts = semCodes.map(code => {
+      const sample = courses.find(c => c.semester_code === code);
+      return { value: code, label: sample ? semesterLabel(sample) : code };
     });
+    populateSelect("filter-semester", semOpts);
+    const $semFilter = document.getElementById("filter-semester");
+    if ($semFilter && semCodes.length) {
+      // Default to S1 2026 (7620) when present, else the most recent semester.
+      $semFilter.value = semCodes.includes("7620") ? "7620" : semCodes[semCodes.length - 1];
+    }
+
+    // Initial render
+    STORE.sort = { key: "course_code", dir: "asc" };
+    STORE.renderFn = renderAllBrowser;
+    bindAllBrowserControls();
+    renderAllBrowser();
+  } catch (err) {
+    $body.innerHTML = `<tr><td colspan="9" class="error">Error loading data: ${escapeHtml(err.message)}</td></tr>`;
+    console.error(err);
   }
 }
 
-// Call theme init immediately once the script runs (DOM is ready because
-// this script is at end of body), and also again inside each page-init in
-// case the button is added dynamically.
-if (typeof document !== "undefined") {
-  initTheme();
+function bindAllBrowserControls() {
+  for (const id of ["search", "filter-semester", "filter-level", "filter-mode", "filter-location", "filter-school"]) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("input", renderAllBrowser);
+  }
+  document.querySelectorAll("table.courses th[data-sort]").forEach(th => {
+    th.addEventListener("click", () => {
+      const key = th.dataset.sort;
+      if (STORE.sort.key === key) {
+        STORE.sort.dir = STORE.sort.dir === "asc" ? "desc" : "asc";
+      } else {
+        STORE.sort = { key, dir: "asc" };
+      }
+      renderAllBrowser();
+    });
+  });
+  // CSV export
+  const $export = document.getElementById("export-csv");
+  if ($export) $export.addEventListener("click", exportAllFilteredAsCsv);
+  const $zipMd = document.getElementById("export-zip-md");
+  if ($zipMd) $zipMd.addEventListener("click", () => exportFilteredAsZip("md"));
+  const $zipJson = document.getElementById("export-zip-json");
+  if ($zipJson) $zipJson.addEventListener("click", () => exportFilteredAsZip("json"));
+  setupSelection();
+}
+
+function applyAllFilters(courses) {
+  const q = (document.getElementById("search")?.value || "").trim().toLowerCase();
+  const sem = document.getElementById("filter-semester")?.value;
+  const level = document.getElementById("filter-level")?.value;
+  const mode = document.getElementById("filter-mode")?.value;
+  const loc = document.getElementById("filter-location")?.value;
+  const school = document.getElementById("filter-school")?.value;
+
+  return courses.filter(c => {
+    if (q) {
+      const hay = `${c.course_code} ${c.course_title || ""} ${c.coordinating_unit || ""}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    if (sem && c.semester_code !== sem) return false;
+    if (level && c.study_level !== level) return false;
+    if (mode && c.attendance_mode !== mode) return false;
+    if (loc && c.location !== loc) return false;
+    if (school && c.coordinating_unit !== school) return false;
+    return true;
+  });
+}
+
+function renderAllBrowser() {
+  const $body = document.getElementById("courses-body");
+  const $count = document.getElementById("course-count");
+  const courses = applySort(applyAllFilters(STORE.allCourses || []));
+  STORE.filtered = courses;
+  $count.textContent = courses.length;
+
+  if (courses.length === 0) {
+    $body.innerHTML = `<tr><td colspan="9" class="empty">No courses match the current filters.</td></tr>`;
+    updateSortIndicators();
+    refreshSelectionUI();
+    return;
+  }
+
+  const rows = courses.map(c => {
+    const levelClass = (c.study_level || "").toLowerCase().includes("post") ? "level-pill pg" : "level-pill";
+    const pfx = coursePrefix(c.course_code);
+    const codeCls = pfx ? `code prefix-${pfx}` : "code";
+    const semLabel = semesterLabel(c);
+    const school = c.coordinating_unit || "";
+    return `
+      <tr>
+        ${selCell(c)}
+        <td class="${codeCls}"><a href="course.html?file=${encodeURIComponent(c.file)}">${escapeHtml(c.course_code || "")}</a></td>
+        <td>${escapeHtml(c.course_title || "")}</td>
+        <td class="nowrap">${escapeHtml(semLabel)}</td>
+        <td><span class="${levelClass}">${escapeHtml(c.study_level || "")}</span></td>
+        <td>${escapeHtml(c.units || "")}</td>
+        <td>${escapeHtml(c.attendance_mode || "")}</td>
+        <td>${escapeHtml(c.location || "")}</td>
+        <td class="school-col">${escapeHtml(school)}</td>
+      </tr>`;
+  }).join("");
+  $body.innerHTML = rows;
+  updateSortIndicators();
+  refreshSelectionUI();
+}
+
+function exportAllFilteredAsCsv() {
+  const courses = coursesForExport(STORE.filtered || []);
+  if (!courses.length) return;
+  const headers = ["course_code", "course_title", "semester_code", "study_level", "units", "attendance_mode", "location", "coordinating_unit"];
+  const csvRows = [headers.join(",")];
+  for (const c of courses) {
+    const row = headers.map(h => {
+      const v = c[h] ?? "";
+      return `"${String(v).replace(/"/g, '""')}"`;
+    });
+    csvRows.push(row.join(","));
+  }
+  downloadBlob(csvRows.join("\n"), "uq-all-courses.csv", "text/csv;charset=utf-8");
 }
 
 // Export to window so inline <script> hooks can call them
 window.UQBS = {
   initBrowser,
+  initAllBrowser,
   initCourseDetail,
   initProgram,
-  initTheme,
-  applyTheme,
+  initAol,
+  initMode,
+  applyMode,
+  // exposed for tests
+  offeringChronKey,
+  buildCourseTimeline,
+  getLegacyCourses,
+  computeOfferingDiff,
+  renderOfferingDiff,
+  EDITION,
+  renderNav,
+  dataUrl,
 };
+
+// Render the header nav from the edition, so the markup stays identical across
+// pages and the dual-build needs no HTML surgery. The UQBS edition shows the
+// AoL + Programs tabs; the All-UQ edition is a lean course browser.
+function renderNav() {
+  if (typeof document === "undefined") return;
+  const page = (document.body && document.body.dataset.page) || "";
+  if (page === "landing") return; // the splash front door has no section nav
+  const nav = document.querySelector("header.site nav");
+  if (!nav) return;
+  const repoUrl = SITE.repoUrl || "https://github.com/uqsmitc6/uqbs-course-profiles";
+  const home = EDITION === "uqbs" ? ["business.html", "UQBS"] : ["browse-all.html", "All UQ"];
+  const links = [["index.html", "⌂ Editions", "_editions"], [home[0], home[1], "home"]];
+  if (EDITION === "uqbs") {
+    links.push(["program.html", "Programs", "programs"], ["aol.html", "AoL", "aol"]);
+  }
+  const html = links
+    .map(([href, label, key]) => `<a href="${href}"${key === page ? ' class="active"' : ""}>${escapeHtml(label)}</a>`)
+    .join("\n      ")
+    + `\n      <a href="${escapeHtml(repoUrl)}" target="_blank" rel="noopener">Repository ↗</a>`;
+  nav.insertAdjacentHTML("afterbegin", html + "\n      ");
+}
+
+(function initChrome() {
+  if (typeof document === "undefined") return;
+  const run = () => { try { renderNav(); } catch (_e) { /* non-fatal */ } };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", run);
+  else run();
+})();

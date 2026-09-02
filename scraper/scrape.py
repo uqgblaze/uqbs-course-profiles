@@ -39,7 +39,8 @@ JACSON_REPO_OWNER = "uq-course-profiles"
 JACSON_REPO_NAME = "jacson"
 GITHUB_TREE_API = "https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
 
-REQUEST_DELAY = 1.0  # seconds between requests (be polite to UQ servers)
+DEFAULT_REQUEST_DELAY = 1.0  # seconds between requests (be polite to UQ servers)
+REQUEST_DELAY = DEFAULT_REQUEST_DELAY
 REQUEST_TIMEOUT = 30  # seconds
 
 # Resolve paths relative to this script's location
@@ -81,6 +82,29 @@ def load_course_list() -> list[str]:
 
     courses = sorted(taxonomy.get("course_programs", {}).keys())
     log.info(f"Loaded {len(courses)} UQBS courses from taxonomy")
+    return courses
+
+
+def load_all_uq_course_list(semester_filter: str | None = None) -> list[str]:
+    """Load all UQ course codes from the JacSON GitHub repo index.
+
+    When semester_filter is given, only returns courses that have profiles
+    in that semester (avoids scraping courses that don't exist for a given
+    semester).
+    """
+    index = _fetch_repo_index()
+    if semester_filter:
+        courses = sorted(
+            code for code, entries in index.items()
+            if any(e["semester"] == semester_filter for e in entries)
+        )
+        log.info(
+            f"Loaded {len(courses)} all-of-UQ courses from JacSON index "
+            f"(filtered to semester {semester_filter})"
+        )
+    else:
+        courses = sorted(index.keys())
+        log.info(f"Loaded {len(courses)} all-of-UQ courses from JacSON index")
     return courses
 
 
@@ -918,6 +942,52 @@ def _extract_policies(soup: BeautifulSoup, profile: dict):
 _WS_RUN = re.compile(r"[ \t\u00A0]+")
 _NL_RUN = re.compile(r"\n{3,}")
 
+# Targeted stopword-join rules — mirror of clean_existing._SPECIFIC_JOINS.
+# These handle the "Policyand Procedure" / "onmy.UQand" family of artefacts
+# that can still slip through even with ``separator=" "`` when the HTML
+# source has no inter-element whitespace. Belt-and-braces: applied after
+# whitespace normalisation as a final polish step.
+_VOCAB_WORDS = (
+    r"Policy|Procedure|Procedures|Guide|Guides|Service|Services|"
+    r"Report|Reports|Manual|Manuals|Library|Integrity|Assessment|Assessments|"
+    r"Examination|Examinations|Adjustment|Adjustments|Code|Codes|Statement|"
+    r"Statements|Framework|Frameworks|Regulation|Regulations|Rule|Rules|"
+    r"Misconduct|Handbook|Handbooks|Plan|Plans|Policies|Act|Acts|Standard|"
+    r"Standards|Charter|Form|Forms"
+)
+_STOPWORDS = r"and|or|the"
+_STOPWORD_JOINS = [
+    (re.compile(rf"\b({_VOCAB_WORDS})({_STOPWORDS})\b"), r"\1 \2"),
+    (re.compile(rf"\b(UQ)({_STOPWORDS})\b"), r"\1 \2"),
+    (re.compile(rf"\b((?:my|Learn)\.UQ)({_STOPWORDS})(?=[a-z])"), r"\1 \2 "),
+    (re.compile(rf"\b((?:my|Learn)\.UQ)({_STOPWORDS})\b"), r"\1 \2"),
+    (re.compile(r"\b(on|at|in|by|via|about)(my\.UQ)"), r"\1 \2"),
+    (re.compile(rf"\b(SI-net)({_STOPWORDS}|to)\b"), r"\1 \2"),
+    (re.compile(rf"(^|\s)(the)({_VOCAB_WORDS})\b"), r"\1\2 \3"),
+    (re.compile(rf"\b({_VOCAB_WORDS})\.([A-Z][a-z])"), r"\1. \2"),
+]
+
+
+def _apply_stopword_joins(s: str) -> str:
+    """Apply targeted stopword-boundary fixes, shielding URLs and emails."""
+    placeholders: list[str] = []
+
+    def _stash(match: re.Match) -> str:
+        placeholders.append(match.group(0))
+        return f"\x00{len(placeholders) - 1}\x00"
+
+    protected = re.sub(r"https?://\S+|\S+@\S+\.\S+", _stash, s)
+    # Two passes so multi-join sequences like "Procedureand thePolicy" get
+    # fully expanded.
+    for _ in range(2):
+        for pattern, repl in _STOPWORD_JOINS:
+            protected = pattern.sub(repl, protected)
+
+    def _unstash(match: re.Match) -> str:
+        return placeholders[int(match.group(1))]
+
+    return re.sub(r"\x00(\d+)\x00", _unstash, protected)
+
 
 def normalise_ws(value):
     """Recursively collapse whitespace in every string found in ``value``.
@@ -925,7 +995,8 @@ def normalise_ws(value):
     Safe for any JSON-compatible tree (str / list / dict / scalar).
     Preserves single and double newlines (paragraph structure) but collapses
     runs of spaces/tabs/NBSPs into one space, trims line edges and trailing
-    whitespace, and reduces 3+ newlines to two.
+    whitespace, and reduces 3+ newlines to two. Also applies targeted
+    stopword-boundary fixes for known UQ policy-text glue patterns.
     """
     if isinstance(value, str):
         s = value.replace("\u00A0", " ")
@@ -933,6 +1004,9 @@ def normalise_ws(value):
         # Trim each line so " paragraph " and trailing runs don't linger
         s = "\n".join(line.strip(" \t") for line in s.split("\n"))
         s = _NL_RUN.sub("\n\n", s)
+        s = _apply_stopword_joins(s)
+        # Re-collapse any accidental double spaces introduced by joins
+        s = _WS_RUN.sub(" ", s)
         return s.strip()
     if isinstance(value, list):
         return [normalise_ws(v) for v in value]
@@ -1023,6 +1097,8 @@ def main(
     semester_filter: str | None = None,
     course_filter: list[str] | None = None,
     max_courses: int | None = None,
+    all_uq: bool = False,
+    delay: float | None = None,
 ):
     """
     Main entry point.
@@ -1032,13 +1108,27 @@ def main(
         course_filter: Only scrape these specific course codes
         max_courses: Limit the number of courses to scrape (useful for testing)
     """
+    # Apply custom delay if specified
+    global REQUEST_DELAY
+    if delay is not None:
+        REQUEST_DELAY = max(0.2, delay)  # floor at 0.2s to stay polite
+
+    mode_label = "All-of-UQ" if all_uq else "UQBS"
     log.info("=" * 60)
-    log.info("UQBS Course Profile Scraper")
+    log.info(f"UQ Course Profile Scraper ({mode_label})")
     log.info(f"Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info(f"Request delay: {REQUEST_DELAY}s")
     log.info("=" * 60)
 
+    # Pre-fetch the JacSON repo index (single GitHub API call) — needed
+    # both for URL discovery and for all-of-UQ course list
+    _fetch_repo_index()
+
     # Load course list
-    all_courses = load_course_list()
+    if all_uq:
+        all_courses = load_all_uq_course_list(semester_filter)
+    else:
+        all_courses = load_course_list()
 
     # Apply filters
     if course_filter:
@@ -1056,9 +1146,6 @@ def main(
 
     log.info(f"Scraping {len(courses)} course(s)...")
     log.info("-" * 60)
-
-    # Pre-fetch the JacSON repo index (single GitHub API call)
-    _fetch_repo_index()
 
     # Scrape
     results = {
@@ -1104,7 +1191,7 @@ def main(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="UQBS Course Profile Scraper")
+    parser = argparse.ArgumentParser(description="UQ Course Profile Scraper")
     parser.add_argument(
         "--semester", "-s",
         help="Only scrape profiles for this semester code (e.g. 7620)",
@@ -1119,10 +1206,25 @@ if __name__ == "__main__":
         type=int,
         help="Maximum number of courses to scrape (useful for testing)",
     )
+    parser.add_argument(
+        "--all-uq",
+        action="store_true",
+        default=False,
+        help="Scrape all UQ courses (not just UQBS). Uses JacSON repo index "
+             "as course list instead of the UQBS taxonomy.",
+    )
+    parser.add_argument(
+        "--delay", "-d",
+        type=float,
+        default=None,
+        help="Seconds between requests (default: 1.0). Minimum 0.2.",
+    )
     args = parser.parse_args()
 
     main(
         semester_filter=args.semester,
         course_filter=args.courses,
         max_courses=args.max,
+        all_uq=args.all_uq,
+        delay=args.delay,
     )
